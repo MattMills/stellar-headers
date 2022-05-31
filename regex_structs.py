@@ -22,7 +22,26 @@ regex = r"((?<initializer>^(?:struct|union)\s+)(?<name>[^{]+)(?<body>{(?:[^}])+}
 #typedef enum enumName { THING=1 } enumName;\n
 
 
-basic_types = ['undefined', 'bool', '__uint64', 'int', 'double', 'uchar', 'uint', 'void', 'char', '__int64', 'ushort', 'float', 'short']
+basic_types = [
+        'undefined', 
+        'bool', 
+        'uchar', 'unsignedchar', 'byte',
+        'char', 'signedchar', 'sbyte',
+        'ushort', 'word', 'unsignedshort',
+        'short', 
+        'uint', 'unsignedint', 'dword',
+        'int', 
+        'double', 
+        'void', 
+        'float', 
+        'ulong',
+        'long', 
+        'ulonglong', '__uint64', 'qword',
+        'longlong', '__int64',
+        ]
+
+type_renames = {
+        }
 
 header_content = "";
 input_version = '3.4.3'
@@ -168,8 +187,8 @@ def parse_wanted_types(wanted_types, unresolved_types, parent_major_type = ''):
         try:
             body_matches = re.finditer(body_re, types[type_name]['body'], re.MULTILINE)
         except:
-            if type_name not in unresolved_types['missing']:
-                unresolved_types['missing'].append(type_name)
+            if type_name not in unresolved_types[parent_major_type]: #formerly 'missing'
+                unresolved_types[parent_major_type].append(type_name) #formerly "missing"
             continue
         for matchNum, match in enumerate(body_matches, start=1):
             body_pre = match.group(1)
@@ -210,6 +229,7 @@ for type_name in wanted_major_types:
     wanted_types[type_name] = []
     unresolved_types[type_name] = [type_name,]
     wanted_types, unresolved_types = parse_wanted_types(wanted_types, unresolved_types , type_name)
+
     for minor_type_name in wanted_types[type_name]:
         if minor_type_name in unresolved_types[type_name] :
             unresolved_types[type_name].remove(minor_type_name)
@@ -255,42 +275,54 @@ def parse_template(template, depth = 0):
                             #We don't need to recurse, no sub-templates
     return output
 
+def collapse_templates(templates):
+    result = []
+    for minor_type_name in templates:
+        for template in templates[minor_type_name]:
+            try:
+                for key, value in template['values'].items():
+                    if type(value) is dict:
+                        sub_result = collapse_templates({'x': [value,]})
+                        for sub_value in sub_result:
+                            if sub_value not in result:
+                                result.append(sub_value)
+                    else:
+                        if value not in result:
+                            result.append(value)
+            except Exception as e:
+                print('Exception %s %s while processing %s' % (type(e), e, template))
+
+    return result
 
 
 wanted_templates = {}
 still_unresolved_types = []
 
-for type_name in unresolved_types['missing']:
-    if type_name in basic_types: #builtins
-        continue
-    if '<' not in type_name: #not a template
-        still_unresolved_types.append(type_name)
-        continue
+for parent_type_name in unresolved_types:
+    for type_name in unresolved_types[parent_type_name]:
+        if type_name in basic_types: #builtins
+            continue
+        if '<' not in type_name: #not a template
+            still_unresolved_types.append(type_name)
+            continue
 
-    template_start = type_name.find('<')
-    template_end = type_name.rfind('>')
-    template_type = type_name[0:template_start]
-    template_str = type_name[template_start+1:template_end]
+        template_start = type_name.find('<')
+        template_end = type_name.rfind('>')
+        template_type = type_name[0:template_start]
+        template_str = type_name[template_start+1:template_end]
 
-    if template_type not in wanted_templates:
-        wanted_templates[template_type] = []
+        if parent_type_name not in wanted_templates:
+            wanted_templates[parent_type_name] = {}
+        if template_type not in wanted_templates[parent_type_name]:
+            wanted_templates[parent_type_name][template_type] = []
 
-    #template_regex = r"<(?:(?>[^<>]+)|(?R))*>"
-    #template_iter = re.finditer(template_regex, template_str)
-    #template_inner = []
-    #for match in template_iter:
-        #print(match)
-    #    template_inner.append((match.start(), match.end(), match.group()))
-
-    #template_arr = {'full_string': template_str, 'parent_type': template_type, 'template_inner': template_inner}
-    template_arr = parse_template(type_name)
-    wanted_templates[template_type].append(template_arr)
+        #template_arr = {'full_string': template_str, 'parent_type': template_type, 'template_inner': template_inner}
+        template_arr = parse_template(type_name)
+        wanted_templates[parent_type_name][template_type].append(template_arr[1])
 
 
 #add templated types to wanted types
 
-with open('dbg.wanted_templates', 'w') as fh:
-    pprint.pprint(wanted_templates, stream=fh)
 
 types_wanted_by = {}
 
@@ -301,10 +333,49 @@ for major_type_name in wanted_types:
         else:
             types_wanted_by[minor_type_name].append(major_type_name)
 
+with open('dbg.wanted_templates', 'w') as fh:
+        pprint.pprint(wanted_templates, stream=fh)
+
+
+def is_integer(n):
+    try:
+        float(n)
+    except ValueError:
+        return False
+    else:
+        return float(n).is_integer()
+
+#collapsed_templates = []
+
+for major_type_name in wanted_templates:
+    result = collapse_templates(wanted_templates[major_type_name])
+    for value in result:
+        if value[-1:] == '*':
+            value = value[:-1] #remove ptr character
+
+        if value.find('::') >= 0: # ghidra doesn't export with class namespaces, so need to remove... probably a better solution with more ghidra scripting
+            if value.find('enum') >= 0:
+                value = value[value.find('::')+2:]
+                value = 'enum' + value
+            else:
+                value = value[value.find('::')+2:]
+
+        if value not in wanted_types[major_type_name] and value not in basic_types and not is_integer(value) and value != '':
+            wanted_types[major_type_name].append(value)
+
+
+#with open('dbg.collapsed_templates', 'w') as fh:
+#        pprint.pprint(collapsed_templates, stream=fh)
+
+wanted_types['shared'] = []
 for minor_type_name in types_wanted_by:
     if len(types_wanted_by[minor_type_name]) > 1:
-        print('WARN: Duplicate types for %s:\t %s' % (minor_type_name, types_wanted_by[minor_type_name]))
+        #print('WARN: Duplicate types for %s:\t %s' % (minor_type_name, types_wanted_by[minor_type_name]))
+        for major_type_name in types_wanted_by[minor_type_name]:
+            wanted_types[major_type_name].remove(minor_type_name)
 
+        if minor_type_name not in wanted_types['shared']:
+            wanted_types['shared'].append(minor_type_name)
 
 for major_type_name in wanted_types:
     fh = open('stellaris.autogenerated.types.%s.h' % (major_type_name,), 'w')
@@ -314,11 +385,42 @@ for major_type_name in wanted_types:
 
     fh.write('#ifndef stellar_header_%s_version\n' % (major_type_name,))
     fh.write('#define stellar_header_%s_version=%s\n' % (major_type_name,input_version))
-    fh.write('#endif\n')
+    fh.write('#endif\n\n\n')
 
+    if major_type_name != 'shared':
+        fh.write('#include "stellaris.autogenerated.types.shared.h"\n\n')
+        fh.write('using namespace std;\n')
+        fh.write('using namespace Eigen;\n\n')
+    else:
+        fh.write(
+                'using namespace std;\n\n'
+                '#include <string>\n'
+                '#include <cstring>\n'
+                '#include <vector>\n'
+                '#include <unordered_map>\n'
+                '#include <atomic>\n'
+                '#include <deque>\n'
+                '#include <queue>\n'
+                '#include <map>\n'
+                '#include <mutex>\n'
+                '\n'
+                '#include "lib/eigen/Eigen/core"\n'
+                '#include "hooking_windows.h"\n\n'
+		)
 
     for minor_type_name in wanted_types[major_type_name]:
-        fh.write(types[minor_type_name]['full_text'])
+        if minor_type_name in types:
+            fh.write(types[minor_type_name]['full_text'])
+        elif minor_type_name in enums:
+            fh.write(enums[minor_type_name]['full_text'])
+        elif 'enum'+minor_type_name in enums:
+            fh_write(enums['enum'+minor_type_name]['full_text']) # for some reason unnamed-type-_UserData style enums exist that don't get caught somewhere
+        elif minor_type_name in basic_types:
+            print('Basic type somehow made it to file output, ignoring type %s in wanted type: %s' % (minor_type_name, major_type_name))
+        else:
+            print('Missing type %s in wanted type: %s' % (minor_type_name, major_type_name))
+            fh.write('//Missing type %s in wanted type: %s\n\n' % (minor_type_name, major_type_name))
+
     fh.close()
 
 with open('dbg.wanted_types', 'w') as fh:
@@ -329,6 +431,9 @@ with open('dbg.wanted_templates', 'w') as fh:
 
 with open('dbg.unresolved_types', 'w') as fh:
     pprint.pprint(unresolved_types, stream=fh)
+
+with open('dbg.enums', 'w') as fh:
+    pprint.pprint(enums, stream=fh)
 
 fh_struct.close()
 fh_struct_template.close()
