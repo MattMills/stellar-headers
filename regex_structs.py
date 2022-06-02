@@ -7,6 +7,9 @@ import pprint
 from datetime import datetime
 import hashlib
 
+#for comparing templates
+import difflib
+
 #regex = r"(^struct\s+)([^{]+)({([^}])+})(;\n*)"
 regex = r"((?<initializer>^(?:struct|union)\s+)(?<name>[^{]+)(?<body>{(?:[^}])+})(?<post>;\n*)|(?:(?<typedef_init>^typedef)\s+(?<td_initializer>[^\s]+)\s*)(?<td_name>[^;{]+)(?<td_post1>[;\s]+)(([;\s]+)|(?<td_body>{[^;{}]+})(?<td_post2>[^;{}]+)(?<td_post3>;\n*)))|(?<unknown>^.*?$)"
 #sorry...
@@ -41,24 +44,44 @@ basic_types = [
         ]
 
 type_renames = {
+        'unsignedint': 'uint',
+        'unsignedchar': 'uchar',
+        'signedchar': 'char',
+        'unsignedshort': 'ushort',
+        'CGalacticObjectClusterconst*': 'CGalacticObjectCluster *',
+        'CEconomicCategoryconst*': 'CEconomicCategory *',
+        'CTraitconst*': 'CTrait *',
+
         }
 
 template_ignore = [
-        'Eigen::Matrix',
-        'Matrix',
+        'Eigen::Matrix', 'Matrix',
+        'allocator',
         'array',
         'basic_string',
+        'char_traits',
+        'equal_to',
+        'hash',
+        'less',
         'map',
+        'pair',
         'shared_ptr',
+        'unordered_map',
+        'vector',
         'std::allocator',
+        'std::array', 
+        'std::basic_string',
         'std::char_traits',
         'std::equal_to',
         'std::hash',
         'std::less',
+        'std::map',
         'std::pair',
         'std::shared_ptr',
-        'unordered_map',
-        'vector',
+        'std::unordered_map',
+        'std::vector',
+        'CPdxHybridArray', # isn't possible to auto-resolve, uses sizeof() one of the fields
+        'CPdxUnorderedMap', # isn't possible to auto-resolve, uses multiple integers that match
         ]
 
 header_content = "";
@@ -156,12 +179,12 @@ for matchNum, match in enumerate(matches, start=1):
         if(initializer == 'struct ' and type_name[0:1] == "C"):
             initializer = 'class '       
 
-        if(body is not None):
+        #if(body is not None):
             #replace struct with class on objects that start with C
-            body_regex = r"^((\s+)(struct)(\s+)((?:C[A-Z][^;]+)[\s]*)+(;))$"
-            body_subst = "\g<2>class\g<4>\g<5>\g<6>"
-            new_body = re.sub(body_regex, body_subst, body, 0, re.MULTILINE)
-            body = new_body
+        #    body_regex = r"^((\s+)(struct)(\s+)((?:C[A-Z][^;]+)[\s]*)+(;))$"
+        #    body_subst = "\g<2>class\g<4>\g<5>\g<6>"
+        #    new_body = re.sub(body_regex, body_subst, body, 0, re.MULTILINE)
+        #    body = new_body
 
 
         if(type_name is not None and '<' in type_name):
@@ -177,6 +200,25 @@ for matchNum, match in enumerate(matches, start=1):
 
     if(output_arr is not None and type_name is not None):
         output_arr[type_name.rstrip()] = arr
+
+    if(body is not None):
+        #add enum to the front of all enums
+        body_regex = r"^((\s+)(enum)(\s+)(enum){0,1}((?:[^;]+)[\s]*)+(;))$"
+        body_subst = "\g<2>\g<3>\g<4>enum\g<6>\g<7>"
+        new_body = re.sub(body_regex, body_subst, arr['full_text'], 0, re.MULTILINE)
+        arr['full_text'] = new_body
+
+        #switch structs to classes for things that start with C[SINGLE CAPITAL LETTER]*;
+        body_regex = r"^((\s+)(struct)(\s+)((?:C[A-Z][^;]+)[\s]*)+(;))$"
+        body_subst = "\g<2>class\g<4>\g<5>\g<6>"
+        new_body = re.sub(body_regex, body_subst, arr['full_text'], 0, re.MULTILINE)
+        arr['full_text'] = new_body
+
+        for type_from, type_to in type_renames.items():
+            body_regex = r"^((\s+)(%s)(\s+)((?:[^;]+)[\s]*)+(;))$" % (type_from, )
+            body_subst = "\g<2>%s\g<4>\g<5>\g<6>" % (type_to, )
+            new_body = re.sub(body_regex, body_subst, arr['full_text'], 0, re.MULTILINE)
+            arr['full_text'] = new_body
 
     fh.write(arr['full_text'])
 
@@ -426,6 +468,12 @@ for major_type_name in wanted_templates:
         #pprint.pprint(result)
     for parent_type_name, arr in result.items():
         if parent_type_name in template_ignore:
+                        continue
+
+        if parent_type_name.find('::') >= 0:
+            parent_type_name = parent_type_name[parent_type_name.find('::') + 2:]
+
+        if parent_type_name in template_ignore:
             continue
         if parent_type_name not in collapsed_templates:
             collapsed_templates[parent_type_name] = {}
@@ -455,6 +503,132 @@ for minor_type_name in types_wanted_by:
 
         if minor_type_name not in wanted_types['shared']:
             wanted_types['shared'].append(minor_type_name)
+
+
+for template_name in collapsed_templates:
+    this_template_versions = {}
+
+    for template_value in collapsed_templates[template_name]:
+        if template_name + template_value in templates:
+            this_template_versions[template_value] = templates[template_name+template_value]
+        elif template_name + template_value + ' ' in templates:
+            this_template_versions[template_value] = templates[template_name + template_value + ' ']
+        else:
+            print('ERROR: Couldnt find matching template: %s%s' % (template_name, template_value))
+
+    
+    parsed_versions = {}
+    for template_value in this_template_versions:
+        parsed_versions[template_value] = parse_template(this_template_versions[template_value]['type_name'])[1]
+        parsed_versions[template_value]['value_pos'] = {}
+        parsed_versions[template_value]['full_text_parts'] = []
+        parsed_versions[template_value]['full_text'] = ''.join([this_template_versions[template_value]['full_text'], ])
+
+        value_set = {}
+        for key, value in parsed_versions[template_value]['values'].items():
+            if type(value) is dict:
+                value_arr = value
+                value = '%s%s' % (value['template_type'], value['template_value'])
+
+            parsed_versions[template_value]['value_pos'][key] = []
+            value_set[key] = [value,]
+            for type_from, type_to in type_renames.items():
+                if(value == type_from):
+                    value_set[key].append(type_to)
+
+        
+        i = parsed_versions[template_value]['full_text'].find(template_name)
+        i += len(template_name)
+
+        parsed_versions[template_value]['full_text_parts'].append(parsed_versions[template_value]['full_text'][0:i])
+
+        parsed_versions[template_value]['value_set'] = value_set
+        while True:
+            found_any = False
+            for key, values in value_set.items():
+                for value in values:
+                    bt_size = 0
+
+                    pos = parsed_versions[template_value]['full_text'].find(value, i)
+                    if(pos < 0 and value.find('::') >= 0):
+                        #if no match, AND it has a class at the front, try again without the class.
+                        value = value[value.find('::')+2:]
+                        pos = parsed_versions[template_value]['full_text'].find(value, i)
+                    if(pos < 0 and value[-1] == '*'):
+                        #if no match and ptr, add a space for the ptr and try again. 
+                        value = value[0:-1] + ' *'
+                        pos = parsed_versions[template_value]['full_text'].find(value, i)
+                    
+                    if pos >= 0:
+                        found_any = True
+                        backtracks = ['class ', 'enum ', 'struct ',]
+
+                        parsed_versions[template_value]['value_pos'][key].append((pos, len(value)))
+                        for bt in backtracks:
+                            if parsed_versions[template_value]['full_text'][pos-len(bt):pos] == bt:
+                                bt_size = len(bt)
+                                pos -= bt_size
+                                break
+
+                        parsed_versions[template_value]['full_text_parts'].append(parsed_versions[template_value]['full_text'][i:pos])
+                        parsed_versions[template_value]['full_text_parts'].append('###VALUE###%s' % (key, ))
+                        i = pos+len(value)+bt_size
+                        break
+            
+            if found_any == False:
+                break
+        parsed_versions[template_value]['full_text_parts'].append(parsed_versions[template_value]['full_text'][i:])
+        parsed_versions[template_value]['full_text_parts'] = ''.join(parsed_versions[template_value]['full_text_parts'])
+
+    
+    last_template = ''
+    template_count = 0
+    match_count = 1
+    for template_value in this_template_versions:
+        template_count += 1
+        if template_count == 1:
+            last_template = parsed_versions[template_value]['full_text_parts']
+            continue
+        if(template_count > 1 and last_template != parsed_versions[template_value]['full_text_parts']):
+            all_match = False
+        else:
+            match_count +=1
+    
+    template_versions = {}
+    #print('%s: Match(%s) count(%s)' % (template_name, all_match, template_count))
+    if(match_count < template_count):
+        print('ERROR auto-template failure %s: count(%s) match_count(%s)' % (template_name, template_count, match_count))
+    for template_value in parsed_versions:
+        md5sum = hashlib.md5(parsed_versions[template_value]['full_text_parts'].encode('utf-8')).hexdigest()
+        if md5sum not in template_versions:
+            template_versions[md5sum] = {'text': parsed_versions[template_value]['full_text_parts'], 'count': 1, 'template_values': [template_value, ]}
+        else:
+            template_versions[md5sum]['count'] += 1
+            template_versions[md5sum]['template_values'].append(template_value)
+
+    
+    fh = open('output/stellaris.autogenerated.templates.%s.h' % (template_name,), 'w')
+
+    fh.write('#pragma once\n\n\n')
+    fh.write('//THIS FILE WAS AUTOMATICALLY GENERATED\n//DO NOT MODIFY!\n//Modifications will be OVERWRITTEN\n\n')
+    fh.write('//Generated at %s for version %s from %s\n' %(datetime.now(), input_version, input_file))
+    fh.write('//Input MD5: %s\n\n' % (input_checksum, ))
+
+    fh.write('#include "stellaris.autogenerated.types.shared.h"\n\n')
+    fh.write('using namespace std;\n')
+    fh.write('using namespace Eigen;\n\n')
+
+    for md5sum in template_versions:
+        fh.write('// Template version %s matches %s template instances\n' % (md5sum, template_versions[md5sum]['count']))
+        for template_value in template_versions[md5sum]['template_values']:
+            fh.write('//     %s \n' % (template_value,))
+
+        fh.write(template_versions[md5sum]['text'])
+
+    fh.close()
+
+
+
 
 
 for major_type_name in wanted_types:
