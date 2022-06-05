@@ -96,13 +96,6 @@ input_checksum = hashlib.md5(header_content.encode('utf-8')).hexdigest()
 
 matches = re.finditer(regex, header_content, re.MULTILINE)
 
-fh_struct = open('struct.h', 'w')
-fh_struct_template = open('struct.template.h', 'w')
-
-fh_typedef = open('typedef.h', 'w')
-fh_typedef_enum = open('typedef.enum.h', 'w')
-fh_typedef_template = open('typedef.template.h', 'w')
-
 fh_other = open('other.h', 'w')
 
 
@@ -110,15 +103,27 @@ fh_other = open('other.h', 'w')
 wanted_major_types = [
         'CApplication', 
         'CGameApplication', 
-        'CGameIdler'
+        'CGameIdler',
+        'CGameState',
+        'CGameStateDatabase',
+        'CConsoleCmdManager',
         ]
 
-types = {}
-typedefs = {}
-enums = {}
 
-templates = {}
-typedef_templates = {}
+
+#Initially we parse ALL of the single input header file, into the structs below
+typedefs = {}
+
+structs = {}
+classes = {}
+enums   = {}
+unions  = {}
+
+union_templates = {}
+enum_templates = {}
+struct_templates = {}
+class_templates = {}
+
 
 for matchNum, match in enumerate(matches, start=1):
     unknown = match.group('unknown')
@@ -144,59 +149,74 @@ for matchNum, match in enumerate(matches, start=1):
             post_name = match.group('td_post2')
             post = match.group('td_post3')
 
+    fh = None
     if is_typedef:
         #typedef
         arr = {'initializer': initializer, 'type_name': type_name, 'body': body, 'post_name': post_name, 'post': post}
-        output_arr = typedefs
 
         if body is None:
             arr['full_text'] = '%s %s %s %s\n' % (typedef_init, initializer, type_name, post)
         else:
             arr['full_text'] = '%s %s %s %s %s%s\n' % (typedef_init, initializer, type_name, body, post_name, post)
 
-        if type_name.find('<') >= 0:
-            fh = fh_typedef_template
-        elif(initializer == 'enum'):
-            #typedef enum
-            fh = fh_typedef_enum
+        if type_name.find('::') >= 0:
+            #strip class name
+            arr['original_type_name'] = type_name
+            arr['type_name'] = type_name = type_name[type_name.find('::')+2:]
+
+        if initializer == 'enum':
             type_name = 'enum' + type_name
-            output_arr = enums
+            if type_name.find('<') >= 0:
+                output_arr = enum_templates
+            else:
+                #typedef enum
+                output_arr = enums
         else:
-            fh = fh_typedef
+            output_arr = typedefs
 
     else:
+        if(initializer == 'struct ' and type_name[0:1] == "C" and type_name[1:2].isupper()):
+            initializer = 'class '
+
         arr = {'initializer': initializer, 'type_name': type_name, 'body': body, 'post': post}
+
+        
 
         if(unknown is not None):
             fh = fh_other
             arr['full_text'] = '%s\n' % (match.group(),)
-    
-        if(initializer != 'struct '):
-            #not typedef, not struct
+            if arr['full_text'][0:2] == '/*' and arr['full_text'] [-2:] == '*/':
+                #ghidra warning comment
+                continue
+
+        elif(initializer not in ['struct ', 'class ', 'union '] ):
             fh = fh_other
             arr['full_text'] = '%s%s%s%s\n' % (initializer, type_name, body, post)
 
-        if(initializer == 'struct ' and type_name[0:1] == "C"):
-            initializer = 'class '       
+        elif(initializer == 'struct '):
+            if(type_name is not None and '<' in type_name):
+                output_arr = struct_templates
+            else:
+                output_arr = structs
 
-        #if(body is not None):
-            #replace struct with class on objects that start with C
-        #    body_regex = r"^((\s+)(struct)(\s+)((?:C[A-Z][^;]+)[\s]*)+(;))$"
-        #    body_subst = "\g<2>class\g<4>\g<5>\g<6>"
-        #    new_body = re.sub(body_regex, body_subst, body, 0, re.MULTILINE)
-        #    body = new_body
-
-
-        if(type_name is not None and '<' in type_name):
-            #template
-            fh = fh_struct_template
-            output_arr = templates
             arr['full_text'] = '%s%s%s%s\n' % (initializer, type_name, body, post)
-        else:
-            #non-template struct
-            fh = fh_struct
-            output_arr = types
+        elif(initializer == 'class ') :
+            if type_name is not None and '<' in type_name:
+                output_arr = class_templates
+            else:
+                output_arr = classes
+
             arr['full_text'] = '%s%s%s%s\n' % (initializer, type_name, body, post)
+        elif(initializer == 'union '):
+            if type_name is not None and '<' in type_name:
+                output_arr = union_templates
+            else:
+                output_arr = unions
+
+            arr['type_name'] = type_name = 'union'+type_name
+            arr['full_text'] = '%s%s%s%s\n' % (initializer, type_name, body, post)
+
+
 
     if(output_arr is not None and type_name is not None):
         output_arr[type_name.rstrip()] = arr
@@ -219,18 +239,14 @@ for matchNum, match in enumerate(matches, start=1):
             body_subst = "\g<2>%s\g<4>\g<5>\g<6>" % (type_to, )
             new_body = re.sub(body_regex, body_subst, arr['full_text'], 0, re.MULTILINE)
             arr['full_text'] = new_body
-
-    fh.write(arr['full_text'])
-
-#with open('dbg.types','w') as fh:
-#    pprint.pprint(types, stream=fh)
-
-#with open('dbg.templates', 'w') as fh:
-#    pprint.pprint(templates, stream=fh)
+    if fh is not None:
+        fh.write(arr['full_text'])
 
 
+#Recursively parse type bodies to find all types
 def parse_wanted_types(wanted_types, unresolved_types, parent_major_type = ''):
-    global types
+    global classes, structs, unions, enums
+
     for type_name in unresolved_types[parent_major_type]:
         if type_name in wanted_types[parent_major_type]:
             continue
@@ -245,18 +261,30 @@ def parse_wanted_types(wanted_types, unresolved_types, parent_major_type = ''):
         new_body = "{\n"
         body_re = r"(^\s+)([^\s]+)\s+([^;]+);"
         try:
-            body_matches = re.finditer(body_re, types[type_name]['body'], re.MULTILINE)
+            if type_name[0:5] == 'union':
+                body_matches = re.finditer(body_re, unions[type_name]['body'], re.MULTILINE)
+            elif type_name[0:4] == 'enum':
+                body_matches = re.finditer(body_re, enums[type_name]['body'], re.MULTILINE)
+            elif type_name in classes:
+                body_matches = re.finditer(body_re, classes[type_name]['body'], re.MULTILINE)
+            elif type_name in structs:
+                body_matches = re.finditer(body_re, structs[type_name]['body'], re.MULTILINE)
+            else:
+                if type_name not in unresolved_types[parent_major_type]: #formerly 'missing'
+                    unresolved_types[parent_major_type].append(type_name) #formerly "missing"
+                continue
         except:
             if type_name not in unresolved_types[parent_major_type]: #formerly 'missing'
                 unresolved_types[parent_major_type].append(type_name) #formerly "missing"
             continue
+
         for matchNum, match in enumerate(body_matches, start=1):
             body_pre = match.group(1)
             body_typename = match.group(2);
             body_typevalue = match.group(3);
             if body_typename == 'struct':
                 body_typevalue_arr = body_typevalue.split(' ');
-                if body_typevalue[0:1] == 'C':
+                if body_typevalue[0:1] == 'C' and body_typevalue[1:2].isupper():
                     body_typename = 'class'
                 if body_typevalue_arr[0] not in unresolved_types[parent_major_type]:
                     unresolved_types[parent_major_type].append(body_typevalue_arr[0])
@@ -277,11 +305,13 @@ def parse_wanted_types(wanted_types, unresolved_types, parent_major_type = ''):
                     unresolved_types[parent_major_type].append(body_typename)
         wanted_types[parent_major_type].append(type_name)
         wanted_types, unresolved_types = parse_wanted_types(wanted_types, unresolved_types, parent_major_type)
+
     return (wanted_types, unresolved_types)
 
 
 
-
+#Parse through wanted_major_types recursively searching for wanted_types
+# if we can't find a type, add it to unresolved types
 wanted_types = {}
 unresolved_types = {}
 
@@ -290,14 +320,20 @@ for type_name in wanted_major_types:
     unresolved_types[type_name] = [type_name,]
     wanted_types, unresolved_types = parse_wanted_types(wanted_types, unresolved_types , type_name)
 
+    #Remove types in unresolved types if they were resolved 
+    #(Past me did this, future me is not sure if this makes sense? Why would we resolve a type that we didn't on the last iteration? Future Future me: Think about this and delete these comments)
     for minor_type_name in wanted_types[type_name]:
         if minor_type_name in unresolved_types[type_name] :
             unresolved_types[type_name].remove(minor_type_name)
+
+    #Remove basic types from unresolved types, they aren't unresolved, they're basic!
     for minor_type_name in unresolved_types[type_name]:
         if minor_type_name in basic_types:
-            print('DEL %s %s' % (type_name, minor_type_name))
             unresolved_types[type_name].remove(minor_type_name)
 
+
+#Recursively parse a template type (this_is_a_template<not_me,but_I_am_too<abc123>,7)
+# output is recursive, so confusing to parse.
 
 def parse_template(template, depth = 0):
     template_regex = r"([^,\s<]*)(<(?:[^<>]|((?2)))+>)|([^,\s]+)"
@@ -335,6 +371,8 @@ def parse_template(template, depth = 0):
                             #We don't need to recurse, no sub-templates
     return output
 
+#Recursively make the recursive template list not-recursive, but only for template VALUES
+#TODO: Is not including template['template_value'] a bug?
 def collapse_templates(templates):
     result = []
     for minor_type_name in templates:
@@ -354,6 +392,9 @@ def collapse_templates(templates):
 
     return result
 
+#Recursively make the recursive template list less-recursive, but including all of the recursive data (confusing right?)
+#Basically, we move everything into 1 layer, but keep the other layers.
+#TODO: See, this one has template['template_value'] (re: the TODO above me...)
 def collapse_templates_with_detail(templates):
     result = {}
     for minor_type_name in templates:
@@ -393,7 +434,10 @@ def collapse_templates_with_detail(templates):
     return result
 
 
-
+#look at types that haven't been resolved
+# and find templates and sub-templates in template string 
+# <this_is_a_template,this_is_also_a_template<dont_forget_me<or_me>>> 
+# and add them to wanted templates
 wanted_templates = {}
 still_unresolved_types = []
 
@@ -420,9 +464,7 @@ for parent_type_name in unresolved_types:
         wanted_templates[parent_type_name][template_type].append(template_arr[1])
 
 
-#add templated types to wanted types
-
-
+#build types_wanted_by detail, so we can figure out merged shared types... probably a better way to do this.
 types_wanted_by = {}
 
 for major_type_name in wanted_types:
@@ -432,10 +474,12 @@ for major_type_name in wanted_types:
         else:
             types_wanted_by[minor_type_name].append(major_type_name)
 
+#debug output
 with open('dbg.wanted_templates', 'w') as fh:
         pprint.pprint(wanted_templates, stream=fh)
 
 
+#Seems obvious...
 def is_integer(n):
     try:
         float(n)
@@ -445,6 +489,8 @@ def is_integer(n):
         return float(n).is_integer()
 
 
+
+#Add templated types and sub types to wanted_types
 for major_type_name in wanted_templates:
     result = collapse_templates(wanted_templates[major_type_name])
     for value in result:
@@ -458,42 +504,69 @@ for major_type_name in wanted_templates:
             else:
                 value = value[value.find('::')+2:]
 
+        if value[-5:] == 'const':
+            value = value[:-5]
+
         if value not in wanted_types[major_type_name] and value not in basic_types and not is_integer(value) and value != '':
             wanted_types[major_type_name].append(value)
 
-collapsed_templates = {}
-for major_type_name in wanted_templates:
-    result = collapse_templates_with_detail(wanted_templates[major_type_name])
-    #if(major_type_name == 'CGameIdler'):
-        #pprint.pprint(result)
-    for parent_type_name, arr in result.items():
-        if parent_type_name in template_ignore:
-                        continue
 
-        if parent_type_name.find('::') >= 0:
-            parent_type_name = parent_type_name[parent_type_name.find('::') + 2:]
+# Creates a single layer of all templates but without removing their depth-ness
+def build_collapsed_templates_with_detail(wanted_templates, template_ignore = {}):
+    collapsed_templates = {}
+    for major_type_name in wanted_templates:
+        result = collapse_templates_with_detail(wanted_templates[major_type_name])
+        for parent_type_name, arr in result.items():
+            if parent_type_name in template_ignore:
+                continue
 
-        if parent_type_name in template_ignore:
-            continue
-        if parent_type_name not in collapsed_templates:
-            collapsed_templates[parent_type_name] = {}
-        for template_value, arr2 in arr.items():
-            if template_value not in collapsed_templates[parent_type_name]:
-                collapsed_templates[parent_type_name][template_value] = arr2
+            if parent_type_name.find('::') >= 0:
+                parent_type_name = parent_type_name[parent_type_name.find('::') + 2:]
 
+            if parent_type_name in template_ignore:
+                continue
+            if parent_type_name not in collapsed_templates:
+                collapsed_templates[parent_type_name] = {}
+
+            for template_value, arr2 in arr.items():
+                if template_value not in collapsed_templates[parent_type_name]:
+                       collapsed_templates[parent_type_name][template_value] = arr2
+    return collapsed_templates
+
+collapsed_templates = build_collapsed_templates_with_detail(wanted_templates, template_ignore)
+
+
+#debug output
 with open('dbg.collapsed_templates', 'w') as fh:
         pprint.pprint(collapsed_templates, stream=fh)
 
-
+#debug output
 with open('dbg.collapsed_templates.text', 'w') as fh:
     for template_name in collapsed_templates:
         for template_value in collapsed_templates[template_name]:
-            if template_name + template_value in templates:
-                fh.write(templates[template_name+template_value]['full_text'])
-            if template_name + template_value + ' ' in templates:
-                fh.write(templates[template_name + template_value + ' ']['full_text'])
+            for template_arr in [class_templates, struct_templates, enum_templates, union_templates]:
+                if template_name + template_value in template_arr:
+                    fh.write(template_arr[template_name+template_value]['full_text'])
+                elif template_name + template_value + ' ' in template_arr:
+                    fh.write(template_arr[template_name + template_value + ' ']['full_text'])
+
+#find sub-templates in body of each template
+for template_name in collapsed_templates:
+    for template_value in collapsed_templates[template_name]:
+        for template_arr in [class_templates, struct_templates, enum_templates, union_templates]:
+            if template_name + template_value in template_arr:
+                template_full_text = template_arr[template_name+template_value]['full_text']
+            elif template_name + template_value + ' ' in template_arr:
+                template_full_text = template_arr[template_name + template_value + ' ']['full_text']
+
+#rebuild collapsed templates so it includes our new data.
+collapsed_templates = build_collapsed_templates_with_detail(wanted_templates, template_ignore)
 
 
+# figure out which types are shared and move them to a shared file (so we can include them from multiple places)
+# I really dont like this, but I can't find a better way to solve this multiple-definition problem right now
+# Maybe there is something with llvm-pdb that can export the original locations so they can be reconstructed?
+# or something with ghidra to export more detail about namespaces?
 wanted_types['shared'] = []
 for minor_type_name in types_wanted_by:
     if len(types_wanted_by[minor_type_name]) > 1:
@@ -508,16 +581,32 @@ for minor_type_name in types_wanted_by:
 for template_name in collapsed_templates:
     this_template_versions = {}
 
+    #Dig through collapsed templates, and make sure we can resolve them
+    #Build a dict of each template that has all the different versions of that template so we can build a merged template definition
+    resolved = 0
+    unresolved = 0
     for template_value in collapsed_templates[template_name]:
-        if template_name + template_value in templates:
-            this_template_versions[template_value] = templates[template_name+template_value]
-        elif template_name + template_value + ' ' in templates:
-            this_template_versions[template_value] = templates[template_name + template_value + ' ']
+        found = False
+        for template_arr in [class_templates, struct_templates, enum_templates, union_templates]:
+            if template_name + template_value in template_arr:
+                this_template_versions[template_value] = template_arr[template_name+template_value]
+                found = True
+            elif template_name + template_value + ' ' in template_arr:
+                this_template_versions[template_value] = template_arr[template_name + template_value + ' ']
+                found = True
+        if not found:
+            unresolved += 1
+            print('ERROR: Unable to resolve template %s %s' % (template_name, template_value))
         else:
-            print('ERROR: Couldnt find matching template: %s%s' % (template_name, template_value))
+            resolved += 1
 
+    #print('INFO: Template resolution stats for %s, unresolved / resolved: %s / %s' % (template_name, unresolved , resolved))
+    
     
     parsed_versions = {}
+    #Build our parsed collection of the variants of this template
+    #(Step 1 in trying to resolve down to a generic template automatically)
+    #(Basically, look at the template parameters and try to replace them in the body of the template with ###VALUE###parameter_position_value)
     for template_value in this_template_versions:
         parsed_versions[template_value] = parse_template(this_template_versions[template_value]['type_name'])[1]
         parsed_versions[template_value]['value_pos'] = {}
@@ -531,7 +620,17 @@ for template_name in collapsed_templates:
                 value = '%s%s' % (value['template_type'], value['template_value'])
 
             parsed_versions[template_value]['value_pos'][key] = []
+
+
             value_set[key] = [value,]
+            
+
+            #Remove this weird const-ness, I dunno what is causing it, feels like a ghidra-ism or bug
+            if(value[-5:] == 'const'):
+                value_set[key].append(value[:-5])
+            if(value[-6:] == 'const*'):
+                value_set[key].append(value[:-6] + '*')
+
             for type_from, type_to in type_renames.items():
                 if(value == type_from):
                     value_set[key].append(type_to)
@@ -581,6 +680,8 @@ for template_name in collapsed_templates:
         parsed_versions[template_value]['full_text_parts'] = ''.join(parsed_versions[template_value]['full_text_parts'])
 
     
+    #Compare each genericized template to the one before it, and see how many are exactly matching
+    #TODO: Wait, with the Md5 part I wrote after this, is this part doing anything? (I guess it's generating the error message...)
     last_template = ''
     template_count = 0
     match_count = 1
@@ -598,6 +699,9 @@ for template_name in collapsed_templates:
     #print('%s: Match(%s) count(%s)' % (template_name, all_match, template_count))
     if(match_count < template_count):
         print('ERROR auto-template failure %s: count(%s) match_count(%s)' % (template_name, template_count, match_count))
+
+
+    #Build a dict with the variants of this template using the md5 hash of the genericized text and sort them on that
     for template_value in parsed_versions:
         md5sum = hashlib.md5(parsed_versions[template_value]['full_text_parts'].encode('utf-8')).hexdigest()
         if md5sum not in template_versions:
@@ -607,6 +711,7 @@ for template_name in collapsed_templates:
             template_versions[md5sum]['template_values'].append(template_value)
 
     
+    #Write our output file for this template
     fh = open('output/stellaris.autogenerated.templates.%s.h' % (template_name,), 'w')
 
     fh.write('#pragma once\n\n\n')
@@ -618,22 +723,36 @@ for template_name in collapsed_templates:
     fh.write('using namespace std;\n')
     fh.write('using namespace Eigen;\n\n')
 
+    # Currently we write all versions, but if there are more than 5 variants we comment out any "singular" variant
+    # Also, the original template parameters are output in a comment before it's matching template
     for md5sum in template_versions:
         fh.write('// Template version %s matches %s template instances\n' % (md5sum, template_versions[md5sum]['count']))
         for template_value in template_versions[md5sum]['template_values']:
             fh.write('//     %s \n' % (template_value,))
+        if(template_count > 5 and template_versions[md5sum]['count'] == 1):
+            fh.write('/*\n')
 
-        fh.write(template_versions[md5sum]['text'])
+        template_text = template_versions[md5sum]['text']
+
+
+        #TODO: de-genericize this into a valid template. Will probably need to make some kind of collapsed value array so we can look at all the values and determine the templated parameter type (IE, is it a typename, is it an integer, etc)
+
+
+
+        fh.write(template_text)
+        if(template_count > 5 and template_versions[md5sum]['count'] == 1):
+            fh.write('*/\n')
 
     fh.close()
 
 
 
 
-
+#TODO: Output the types for our major wanted types and the shared file.
 for major_type_name in wanted_types:
     fh = open('output/stellaris.autogenerated.types.%s.h' % (major_type_name,), 'w')
     
+    #TODO: This is ugly, move to some kind of templated header file?
     fh.write('#pragma once\n\n\n//THIS FILE WAS AUTOMATICALLY GENERATED\n//DO NOT MODIFY!\n//Modifications will be OVERWRITTEN\n\n')
     fh.write('//Generated at %s for version %s from %s\n' %(datetime.now(), input_version, input_file))
     fh.write('//Input MD5: %s\n\n' % (input_checksum, ))
@@ -663,36 +782,41 @@ for major_type_name in wanted_types:
                 '#include "hooking_windows.h"\n\n'
 		)
 
+    #Final resolution of type to write to file
     for minor_type_name in wanted_types[major_type_name]:
-        if minor_type_name in types:
-            fh.write(types[minor_type_name]['full_text'])
+        if minor_type_name in classes:
+            fh.write(classes[minor_type_name]['full_text'])
+        elif minor_type_name in structs:
+            fh.write(structs[minor_type_name]['full_text'])
         elif minor_type_name in enums:
             fh.write(enums[minor_type_name]['full_text'])
-        elif 'enum'+minor_type_name in enums:
-            fh_write(enums['enum'+minor_type_name]['full_text']) # for some reason unnamed-type-_UserData style enums exist that don't get caught somewhere
+        elif minor_type_name in unions: 
+            fh.write(unions[minor_type_name]['full_text'])
         elif minor_type_name in basic_types:
-            print('Basic type somehow made it to file output, ignoring type %s in wanted type: %s' % (minor_type_name, major_type_name))
+            print('WARNING: Basic type somehow made it to file output, ignoring type %s in wanted type: %s' % (minor_type_name, major_type_name))
         else:
-            print('Missing type %s in wanted type: %s' % (minor_type_name, major_type_name))
+            #If we can't resolve anything at this point, we'll output an error message and write it in a comment so it's obvious, but continue, there is some weirdness that will probably need to be fixed by hand
+            print('ERROR: Missing type %s in wanted type: %s' % (minor_type_name, major_type_name))
             fh.write('//Missing type %s in wanted type: %s\n\n' % (minor_type_name, major_type_name))
 
     fh.close()
 
-with open('dbg.wanted_types', 'w') as fh:
-    pprint.pprint(wanted_types, stream=fh)
+#Close this open file handle, has the "other" (IE, we didn't parse this stuff) header output.
+fh_other.close()
 
-with open('dbg.wanted_templates', 'w') as fh:
-    pprint.pprint(wanted_templates, stream=fh)
+#Debug
+with open('dbg.typedefs', 'w') as fh:
+    pprint.pprint(typedefs, stream=fh)
+
+#with open('dbg.wanted_types', 'w') as fh:
+#    pprint.pprint(wanted_types, stream=fh)
+
+#with open('dbg.wanted_templates', 'w') as fh:
+#    pprint.pprint(wanted_templates, stream=fh)
 
 with open('dbg.unresolved_types', 'w') as fh:
     pprint.pprint(unresolved_types, stream=fh)
 
-with open('dbg.enums', 'w') as fh:
-    pprint.pprint(enums, stream=fh)
+#with open('dbg.enums', 'w') as fh:
+#    pprint.pprint(enums, stream=fh)
 
-fh_struct.close()
-fh_struct_template.close()
-fh_typedef.close()
-fh_typedef_enum.close()
-fh_typedef_template.close()
-fh_other.close()
