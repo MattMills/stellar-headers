@@ -7,10 +7,8 @@ import pprint
 from datetime import datetime
 import hashlib
 
-#for comparing templates
-import difflib
 
-#regex = r"(^struct\s+)([^{]+)({([^}])+})(;\n*)"
+#Regex for parsing input header file
 regex = r"((?<initializer>^(?:struct|union)\s+)(?<name>[^{]+)(?<body>{(?:[^}])+})(?<post>;\n*)|(?:(?<typedef_init>^typedef)\s+(?<td_initializer>[^\s]+)\s*)(?<td_name>[^;{]+)(?<td_post1>[;\s]+)(([;\s]+)|(?<td_body>{[^;{}]+})(?<td_post2>[^;{}]+)(?<td_post3>;\n*)))|(?<unknown>^.*?$)"
 #sorry...
 #if struct | union:
@@ -25,6 +23,11 @@ regex = r"((?<initializer>^(?:struct|union)\s+)(?<name>[^{]+)(?<body>{(?:[^}])+}
 #typedef enum enumName { THING=1 } enumName;\n
 
 
+
+#config
+
+# basic C++ types that should get ignored for type parsing
+#TODO: these should be defined in the shared file
 basic_types = [
         'undefined', 
         'bool', 
@@ -43,6 +46,8 @@ basic_types = [
         'longlong', '__int64',
         ]
 
+#Rename a type, doesn't always actually rename
+#TODO: is const stuff superfluous now that I added other const code below?
 type_renames = {
         'unsignedint': 'uint',
         'unsignedchar': 'uchar',
@@ -54,6 +59,11 @@ type_renames = {
 
         }
 
+#Templates that should be ignored for the final resolution
+#includes standard templates, included libraries (Eigen), and stuff that can't genericize because they are too complex
+#(IE, if we have one variant of a template and it includes <0,0,0> then we can't figure out which parameter is which 0 in the body).
+#TODO: Better solution for that ^
+#TODO: Better solution for included libraries?
 template_ignore = [
         'Eigen::Matrix', 'Matrix',
         'allocator',
@@ -84,31 +94,34 @@ template_ignore = [
         'CPdxUnorderedMap', # isn't possible to auto-resolve, uses multiple integers that match
         ]
 
-header_content = "";
-input_version = '3.4.3'
-input_file = 'stellaris.%s.input.h' % (input_version,)
 
-with open(input_file, 'r') as fh:
-    header_content += fh.read()
-
-input_checksum = hashlib.md5(header_content.encode('utf-8')).hexdigest()
-
-
-matches = re.finditer(regex, header_content, re.MULTILINE)
-
-fh_other = open('other.h', 'w')
-
-
-
+#"Wanted" major types are the root of our resolution tree of types.
 wanted_major_types = [
-        'CApplication', 
-        'CGameApplication', 
+        'CApplication',
+        'CGameApplication',
         'CGameIdler',
         'CGameState',
         'CGameStateDatabase',
         'CConsoleCmdManager',
         ]
 
+#Version is defined seperately so we can easily use it in the output filenames and in a define
+input_version = '3.4.3'
+input_file = 'stellaris.%s.input.h' % (input_version,)
+
+#/config
+
+#Read the input header file into memory
+header_content = "";
+with open(input_file, 'r') as fh:
+    header_content += fh.read()
+
+#Build a checksum of the input file to put in the output file comments for future troubleshooting
+input_checksum = hashlib.md5(header_content.encode('utf-8')).hexdigest()
+
+
+#We output things we can't/don't parse to this file (semi-debug)
+fh_other = open('other.h', 'w')
 
 
 #Initially we parse ALL of the single input header file, into the structs below
@@ -124,7 +137,9 @@ enum_templates = {}
 struct_templates = {}
 class_templates = {}
 
-
+#Initial parsing logic
+#TODO: move into a func, collapse all types into a single dict types = {'structs': {}, 'classes': {}...
+matches = re.finditer(regex, header_content, re.MULTILINE)
 for matchNum, match in enumerate(matches, start=1):
     unknown = match.group('unknown')
 
@@ -137,6 +152,7 @@ for matchNum, match in enumerate(matches, start=1):
     output_arr = None
 
     if unknown is None and initializer is None:
+        #Regex above is two regexes smushed together, one for typedefs, one for not-typedefs
         is_typedef = True
         typedef_init = match.group('typedef_init')
         initializer = match.group('td_initializer')
@@ -149,6 +165,7 @@ for matchNum, match in enumerate(matches, start=1):
             post_name = match.group('td_post2')
             post = match.group('td_post3')
 
+    #fh here is our OUTPUT file handle, if any.
     fh = None
     if is_typedef:
         #typedef
@@ -175,12 +192,12 @@ for matchNum, match in enumerate(matches, start=1):
             output_arr = typedefs
 
     else:
+        #If it looks like a class, make it a class, since ghidra outputs everything as structs.
         if(initializer == 'struct ' and type_name[0:1] == "C" and type_name[1:2].isupper()):
             initializer = 'class '
 
         arr = {'initializer': initializer, 'type_name': type_name, 'body': body, 'post': post}
-
-        
+       
 
         if(unknown is not None):
             fh = fh_other
@@ -217,10 +234,12 @@ for matchNum, match in enumerate(matches, start=1):
             arr['full_text'] = '%s%s%s%s\n' % (initializer, type_name, body, post)
 
 
-
+    # Clean up any extra whitespace
     if(output_arr is not None and type_name is not None):
         output_arr[type_name.rstrip()] = arr
 
+
+    # Body modifications
     if(body is not None):
         #add enum to the front of all enums
         body_regex = r"^((\s+)(enum)(\s+)(enum){0,1}((?:[^;]+)[\s]*)+(;))$"
@@ -239,6 +258,8 @@ for matchNum, match in enumerate(matches, start=1):
             body_subst = "\g<2>%s\g<4>\g<5>\g<6>" % (type_to, )
             new_body = re.sub(body_regex, body_subst, arr['full_text'], 0, re.MULTILINE)
             arr['full_text'] = new_body
+
+    #Write to an output file if it's set
     if fh is not None:
         fh.write(arr['full_text'])
 
