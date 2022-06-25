@@ -44,6 +44,7 @@ basic_types = [
         'long', 
         'ulonglong', '__uint64', 'qword',
         'longlong', '__int64',
+        'void', 'void *', 'void * *',
         ]
 
 #Rename a type, doesn't always actually rename
@@ -106,7 +107,7 @@ wanted_major_types = [
         ]
 
 #Version is defined seperately so we can easily use it in the output filenames and in a define
-input_version = '3.4.3'
+input_version = '3.4.4'
 input_file = 'stellaris.%s.input.h' % (input_version,)
 
 #/config
@@ -196,6 +197,18 @@ for matchNum, match in enumerate(matches, start=1):
         if(initializer == 'struct ' and type_name[0:1] == "C" and type_name[1:2].isupper()):
             initializer = 'class '
 
+        if type_name is not None:
+            template_start = type_name.find('<')
+            template_end = type_name.rfind('>')
+        else:
+            template_start = -1
+            template_end = -1
+
+        if template_start >= 0 and template_end >= 0:
+            type_name = type_name[0:template_end+1] 
+            #For some reason some types have text AFTER the template value, which doesn't work with the code here... Hoping it's only a handful and / or it's coming from Ghidra rather than the original code.
+            #Just going to strip it for now.
+
         arr = {'initializer': initializer, 'type_name': type_name, 'body': body, 'post': post}
        
 
@@ -250,6 +263,12 @@ for matchNum, match in enumerate(matches, start=1):
         #switch structs to classes for things that start with C[SINGLE CAPITAL LETTER]*;
         body_regex = r"^((\s+)(struct)(\s+)((?:C[A-Z][^;]+)[\s]*)+(;))$"
         body_subst = "\g<2>class\g<4>\g<5>\g<6>"
+        new_body = re.sub(body_regex, body_subst, arr['full_text'], 0, re.MULTILINE)
+        arr['full_text'] = new_body
+
+        #add union to the front of all unions
+        body_regex = r"^((\s+)(union)(\s+)(union){0,1}((?:[^;]+)[\s]*)+(;))$"
+        body_subst = "\g<2>\g<3>\g<4>union\g<6>\g<7>"
         new_body = re.sub(body_regex, body_subst, arr['full_text'], 0, re.MULTILINE)
         arr['full_text'] = new_body
 
@@ -392,6 +411,13 @@ def parse_template(template, depth = 0):
                             #We don't need to recurse, no sub-templates
     return output
 
+# Parse templates out of the body of a template, non-recursively.
+def parse_template_body(template):
+    template_body_regex = r""
+    matches = re.finditer(template_regex, template)
+    output = {}
+
+
 #Recursively make the recursive template list not-recursive, but only for template VALUES
 #TODO: Is not including template['template_value'] a bug?
 def collapse_templates(templates):
@@ -485,20 +511,6 @@ for parent_type_name in unresolved_types:
         wanted_templates[parent_type_name][template_type].append(template_arr[1])
 
 
-#build types_wanted_by detail, so we can figure out merged shared types... probably a better way to do this.
-types_wanted_by = {}
-
-for major_type_name in wanted_types:
-    for minor_type_name in wanted_types[major_type_name]:
-        if minor_type_name not in types_wanted_by:
-            types_wanted_by[minor_type_name] = [major_type_name,]
-        else:
-            types_wanted_by[minor_type_name].append(major_type_name)
-
-#debug output
-with open('dbg.wanted_templates', 'w') as fh:
-        pprint.pprint(wanted_templates, stream=fh)
-
 
 #Seems obvious...
 def is_integer(n):
@@ -551,7 +563,10 @@ def build_collapsed_templates_with_detail(wanted_templates, template_ignore = {}
 
             for template_value, arr2 in arr.items():
                 if template_value not in collapsed_templates[parent_type_name]:
-                       collapsed_templates[parent_type_name][template_value] = arr2
+                    arr2['parent_major_types'] = [major_type_name,]
+                    collapsed_templates[parent_type_name][template_value] = arr2
+                else:
+                    collapsed_templates[parent_type_name][template_value]['parent_major_types'].append(major_type_name)
     return collapsed_templates
 
 collapsed_templates = build_collapsed_templates_with_detail(wanted_templates, template_ignore)
@@ -571,18 +586,69 @@ with open('dbg.collapsed_templates.text', 'w') as fh:
                 elif template_name + template_value + ' ' in template_arr:
                     fh.write(template_arr[template_name + template_value + ' ']['full_text'])
 
+
+
 #find sub-templates in body of each template
 for template_name in collapsed_templates:
     for template_value in collapsed_templates[template_name]:
         for template_arr in [class_templates, struct_templates, enum_templates, union_templates]:
             if template_name + template_value in template_arr:
-                template_full_text = template_arr[template_name+template_value]['full_text']
+                template = template_arr[template_name+template_value]
             elif template_name + template_value + ' ' in template_arr:
-                template_full_text = template_arr[template_name + template_value + ' ']['full_text']
+                template = template_arr[template_name + template_value + ' ']
+
+            template_full_text = template['full_text']
+            template_body_regex = r"^(\s+)(.*?)\s([^{};\s]+)[;\s]*$"
+            parent_major_types = collapsed_templates[template_name][template_value]['parent_major_types']
+            matches = re.finditer(template_body_regex, template_full_text, re.MULTILINE)
+            for match in matches:
+                full_type_name = match.group(2)
+                type_variable = match.group(3)
+                
+                type_name_parts = full_type_name.split(' ')
+                initializer = type_name_parts[0]
+                try:
+                    type_name = type_name_parts[1]
+                except:
+                    type_name = full_type_name
+
+
+
+                if '<' in type_name:
+                    template_start = type_name.find('<')
+                    template_end = type_name.rfind('>')
+                    template_type = type_name[0:template_start]
+
+                    for parent_major_type in parent_major_types:
+                        if template_type not in wanted_templates[parent_type_name]:
+                            wanted_templates[parent_type_name][template_type] = []
+
+                            template_arr = parse_template(type_name)
+                            wanted_templates[parent_type_name][template_type].append(template_arr[1])
+
+                elif type_name in basic_types:
+                    continue
+                else:
+                    #continue
+                    if type_name not in wanted_types[parent_type_name]:
+                        wanted_types[parent_type_name].append(type_name)
+
+
+
 
 #rebuild collapsed templates so it includes our new data.
 collapsed_templates = build_collapsed_templates_with_detail(wanted_templates, template_ignore)
 
+
+#build types_wanted_by detail, so we can figure out merged shared types... probably a better way to do this.
+types_wanted_by = {}
+
+for major_type_name in wanted_types:
+    for minor_type_name in wanted_types[major_type_name]:
+        if minor_type_name not in types_wanted_by:
+            types_wanted_by[minor_type_name] = [major_type_name,]
+        else:
+            types_wanted_by[minor_type_name].append(major_type_name)
 
 # figure out which types are shared and move them to a shared file (so we can include them from multiple places)
 # I really dont like this, but I can't find a better way to solve this multiple-definition problem right now
@@ -681,7 +747,7 @@ for template_name in collapsed_templates:
                     
                     if pos >= 0:
                         found_any = True
-                        backtracks = ['class ', 'enum ', 'struct ',]
+                        backtracks = ['class ', 'enum ', 'struct ', 'union ',]
 
                         parsed_versions[template_value]['value_pos'][key].append((pos, len(value)))
                         for bt in backtracks:
@@ -829,11 +895,15 @@ fh_other.close()
 with open('dbg.typedefs', 'w') as fh:
     pprint.pprint(typedefs, stream=fh)
 
-#with open('dbg.wanted_types', 'w') as fh:
-#    pprint.pprint(wanted_types, stream=fh)
+with open('dbg.union_templates', 'w') as fh:
+    pprint.pprint(union_templates, stream=fh)
 
-#with open('dbg.wanted_templates', 'w') as fh:
-#    pprint.pprint(wanted_templates, stream=fh)
+with open('dbg.wanted_types', 'w') as fh:
+    pprint.pprint(wanted_types, stream=fh)
+
+with open('dbg.wanted_templates', 'w') as fh:
+    pprint.pprint(wanted_templates, stream=fh)
+
 
 with open('dbg.unresolved_types', 'w') as fh:
     pprint.pprint(unresolved_types, stream=fh)
@@ -841,3 +911,5 @@ with open('dbg.unresolved_types', 'w') as fh:
 #with open('dbg.enums', 'w') as fh:
 #    pprint.pprint(enums, stream=fh)
 
+with open('dbg.types_wanted_by', 'w') as fh:
+    pprint.pprint(types_wanted_by, stream=fh)
